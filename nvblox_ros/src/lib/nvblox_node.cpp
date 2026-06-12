@@ -23,6 +23,8 @@
 #include <nvblox/utils/delays.h>
 #include <nvblox/utils/rates.h>
 
+#include <cmath>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -208,6 +210,21 @@ void NvbloxNode::initializeMultiMapper()
   //              and these handles wouldn't be needed.
   static_mapper_ = multi_mapper_.get()->background_mapper();
   dynamic_mapper_ = multi_mapper_.get()->foreground_mapper();
+
+  // Low-object detection covers the height band BELOW the esdf slice:
+  // [low_obj_min_height_m, esdf_slice_min_height). An empty/inverted band is
+  // a configuration error.
+  if (params_.publish_low_obj_map_slice) {
+    const float band_max = static_mapper_->esdf_integrator().esdf_slice_min_height();
+    if (params_.low_obj_min_height_m >= band_max) {
+      RCLCPP_FATAL_STREAM(
+        get_logger(),
+        "low_obj_min_height_m (" << params_.low_obj_min_height_m
+                                 << ") must be below esdf_slice_min_height (" << band_max
+                                 << "): the low-object band would be empty. Exiting.");
+      exit(1);
+    }
+  }
 }
 
 void NvbloxNode::subscribeToTopics()
@@ -384,6 +401,15 @@ void NvbloxNode::advertiseTopics()
       create_publisher<sensor_msgs::msg::PointCloud2>("~/pessimistic_static_esdf_pointcloud", 1);
     pessimistic_static_map_slice_publisher_ =
       create_publisher<nvblox_msgs::msg::DistanceMapSlice>("~/pessimistic_static_map_slice", 1);
+  }
+
+  if (params_.publish_low_obj_map_slice) {
+    low_obj_map_slice_publisher_ =
+      create_publisher<nvblox_msgs::msg::DistanceMapSlice>("~/low_obj_map_slice", 1);
+    low_obj_occupancy_grid_publisher_ =
+      create_publisher<nav_msgs::msg::OccupancyGrid>("~/low_obj_occupancy_grid", 1);
+    low_obj_points_publisher_ =
+      create_publisher<sensor_msgs::msg::PointCloud2>("~/low_obj_points", 1);
   }
 
   if (isHumanMapping(params_.mapping_type)) {
@@ -1007,12 +1033,17 @@ bool NvbloxNode::processDepthImage(const ImageTypeVariant & depth_msg)
   {
     return false;
   }
+  // Planar robots: replace VSLAM roll/pitch/z with the calibrated mount.
+  // Feeds ALL consumers below: static TSDF, freespace, dynamic occupancy,
+  // and the low-object detector.
+  T_L_C_depth_ = planarizeCameraPose(T_L_C_depth_);
   Transform T_L_C_mask;
   Transform T_CM_CD;
   if (mask_img_opt) {
     if (!transformer_.lookupTransformToGlobalFrame(mask_frame, mask_image_timestamp, &T_L_C_mask)) {
       return false;
     }
+    T_L_C_mask = planarizeCameraPose(T_L_C_mask);
     T_CM_CD = T_L_C_mask.inverse() * T_L_C_depth_;
   }
 
@@ -1090,7 +1121,262 @@ bool NvbloxNode::processDepthImage(const ImageTypeVariant & depth_msg)
     }
   }
   back_projected_depth_timer.Stop();
+
+  // Detect low objects (below the esdf slice band) from this raw depth frame.
+  if (params_.publish_low_obj_map_slice) {
+    timing::Timer low_obj_timer("ros/depth/output/low_obj");
+    processLowObjects(depth_camera_, depth_image_timestamp);
+    low_obj_timer.Stop();
+  }
   return true;
+}
+
+Transform NvbloxNode::planarizeCameraPose(const Transform & T_L_C) const
+{
+  if (params_.planar_tf_camera_height_m <= 0.f) {
+    return T_L_C;
+  }
+  // The robot is planar and the camera bolted on: trust x, y, yaw from live
+  // TF; replace roll, pitch, height with the calibrated mount. Live VSLAM
+  // pitch wanders ~1 deg, which alone shifts apparent floor height by ~1 cm
+  // at 0.5 m -- fatal for sub-5cm height classification and a height-noise
+  // source for all integration.
+  Transform T_planar = T_L_C;
+  const Eigen::Vector3f view_dir = T_L_C.rotation().col(2);  // optical +z
+  const float heading = std::atan2(view_dir.y(), view_dir.x());
+  Eigen::Matrix3f optical_to_flu;  // optical (x right, y down, z fwd) -> FLU
+  optical_to_flu << 0, 0, 1,
+    -1, 0, 0,
+    0, -1, 0;
+  T_planar.linear() =
+    (Eigen::AngleAxisf(heading, Eigen::Vector3f::UnitZ()) *
+    Eigen::AngleAxisf(params_.planar_tf_camera_roll_rad, Eigen::Vector3f::UnitX()) *
+    Eigen::AngleAxisf(params_.planar_tf_camera_pitch_rad, Eigen::Vector3f::UnitY())).matrix() *
+    optical_to_flu;
+  T_planar.translation().z() = params_.planar_tf_camera_height_m;
+  RCLCPP_INFO_ONCE(
+    get_logger(), "PLANAR TF mode for camera integration (calibrated roll %.2f deg, "
+    "pitch %.2f deg, height %.3f m; live TF supplies x, y, yaw only)",
+    params_.planar_tf_camera_roll_rad * 180.f / M_PI,
+    params_.planar_tf_camera_pitch_rad * 180.f / M_PI,
+    params_.planar_tf_camera_height_m.get());
+  return T_planar;
+}
+
+void NvbloxNode::processLowObjects(const Camera & camera, const rclcpp::Time & timestamp)
+{
+  // Band: [low_obj_min_height_m, esdf_slice_min_height) in the global frame.
+  // Validated non-empty at startup.
+  const float band_min = params_.low_obj_min_height_m;
+  const float band_max = static_mapper_->esdf_integrator().esdf_slice_min_height();
+  const float radius = params_.low_obj_radius_m;
+  const float res = params_.voxel_size;
+
+  // T_L_C_depth_ is already planarized in processDepthImage when PLANAR TF
+  // mode is enabled (planar_tf_camera_height_m > 0).
+
+  // Back-project this depth frame and transform the points into the global
+  // frame. Depth is clipped generously above the radius: the radius gate below
+  // is horizontal while back-projection distance is euclidean from the camera.
+  image_back_projector_.backProjectOnGPU(
+    depth_image_, camera, &low_obj_pointcloud_C_device_, 2.f * radius);
+  transformPointcloudOnGPU(
+    T_L_C_depth_, low_obj_pointcloud_C_device_, &low_obj_pointcloud_L_device_,
+    cuda_stream_.get());
+  // The pointcloud lives in device memory (kDevice): host access segfaults, so
+  // copy the points to a host vector before binning.
+  const std::vector<Vector3f> points_L_host =
+    low_obj_pointcloud_L_device_.points().toVectorAsync(*cuda_stream_);
+  cuda_stream_->synchronize();
+
+  // Bin points into cells: a band hit marks a cell occupied; a cell whose
+  // column shows only floor (below band_min) this frame is observed-clear.
+  // Heights below -10cm are discarded as depth noise (below the floor).
+  const Vector3f camera_position = T_L_C_depth_.translation();
+  constexpr float kMinValidHeight = -0.10f;
+  const bool publish_debug_points =
+    low_obj_points_publisher_->get_subscription_count() > 0;
+  std::vector<Vector3f> debug_points;
+  // Per-cell band evidence this frame: {point count, max height}. A cell only
+  // becomes an obstacle with >= low_obj_min_points band points (speckle gate);
+  // a real object face presents hundreds of points per cell at this range.
+  std::map<std::pair<int, int>, std::pair<int, float>> band_now;
+  std::set<std::pair<int, int>> floor_now;
+  for (const Vector3f & p : points_L_host) {
+    const float dx = p.x() - camera_position.x();
+    const float dy = p.y() - camera_position.y();
+    if (dx * dx + dy * dy > radius * radius) {
+      continue;
+    }
+    const std::pair<int, int> cell(
+      static_cast<int>(std::floor(p.x() / res)), static_cast<int>(std::floor(p.y() / res)));
+    if (p.z() >= band_min && p.z() < band_max) {
+      auto [it, inserted] = band_now.emplace(cell, std::make_pair(1, p.z()));
+      if (!inserted) {
+        it->second.first++;
+        it->second.second = std::max(it->second.second, p.z());
+      }
+    } else if (p.z() < band_min && p.z() > kMinValidHeight) {
+      floor_now.insert(cell);
+      // Debug: live floor points give context around the persisted cells.
+      if (publish_debug_points) {
+        debug_points.push_back(p);
+      }
+    }
+  }
+  std::map<std::pair<int, int>, float> occupied_now;
+  for (const auto & [cell, count_and_height] : band_now) {
+    if (count_and_height.first >= params_.low_obj_min_points) {
+      occupied_now.emplace(cell, count_and_height.second);
+    }
+  }
+  // Temporal gate: a cell must pass the points gate in low_obj_min_frames
+  // CONSECUTIVE observed frames before it is marked. A frame that observes the
+  // cell without it qualifying resets the streak; a frame that doesn't see the
+  // cell at all keeps it (the two cameras alternate and have disjoint FOVs).
+  std::map<std::pair<int, int>, float> promoted;
+  for (const auto & [cell, height] : occupied_now) {
+    auto [it, inserted] = low_obj_pending_.emplace(cell, std::make_pair(1, height));
+    if (!inserted) {
+      it->second.first++;
+      it->second.second = std::max(it->second.second, height);
+    }
+    if (it->second.first >= params_.low_obj_min_frames) {
+      promoted.emplace(cell, it->second.second);
+    }
+  }
+  const float pending_prune_sq = (2.f * radius + 1.f) * (2.f * radius + 1.f);
+  for (auto it = low_obj_pending_.begin(); it != low_obj_pending_.end(); ) {
+    const bool was_promoted = promoted.count(it->first) > 0;
+    const bool observed = band_now.count(it->first) > 0 || floor_now.count(it->first) > 0;
+    const bool qualified = occupied_now.count(it->first) > 0;
+    const float pcx = (it->first.first + 0.5f) * res - camera_position.x();
+    const float pcy = (it->first.second + 0.5f) * res - camera_position.y();
+    const bool far_away = pcx * pcx + pcy * pcy > pending_prune_sq;
+    if (was_promoted || (observed && !qualified) || far_away) {
+      it = low_obj_pending_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  // Update the persistent cell map: max-merge promoted cells, clear floor-only
+  // cells, and drop cells left far behind the robot (the local costmap rolls
+  // anyway).
+  for (const auto & [cell, height] : promoted) {
+    auto [it, inserted] = low_obj_cells_.emplace(cell, height);
+    if (!inserted) {
+      it->second = std::max(it->second, height);
+    }
+  }
+  for (const auto & cell : floor_now) {
+    if (band_now.count(cell) == 0) {  // truly clean floor: zero band evidence
+      low_obj_cells_.erase(cell);
+    }
+  }
+  const float prune_radius_sq = (2.f * radius + 1.f) * (2.f * radius + 1.f);
+  for (auto it = low_obj_cells_.begin(); it != low_obj_cells_.end(); ) {
+    const float cx = (it->first.first + 0.5f) * res - camera_position.x();
+    const float cy = (it->first.second + 0.5f) * res - camera_position.y();
+    if (cx * cx + cy * cy > prune_radius_sq) {
+      it = low_obj_cells_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  if (publish_debug_points) {
+    // One point per persisted cell at its stored max band height (so ALL
+    // lethal cells get a height, even those outside the current camera view),
+    // plus the live floor points collected above for context.
+    for (const auto & [cell, height] : low_obj_cells_) {
+      debug_points.emplace_back(
+        (cell.first + 0.5f) * res, (cell.second + 0.5f) * res, height);
+    }
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header.frame_id = params_.global_frame.get();
+    cloud.header.stamp = timestamp;
+    cloud.height = 1;
+    cloud.width = debug_points.size();
+    cloud.fields.resize(3);
+    const char * names[3] = {"x", "y", "z"};
+    for (int i = 0; i < 3; ++i) {
+      cloud.fields[i].name = names[i];
+      cloud.fields[i].offset = 4 * i;
+      cloud.fields[i].datatype = sensor_msgs::msg::PointField::FLOAT32;
+      cloud.fields[i].count = 1;
+    }
+    cloud.is_bigendian = false;
+    cloud.point_step = 12;
+    cloud.row_step = cloud.point_step * cloud.width;
+    cloud.is_dense = true;
+    cloud.data.resize(cloud.row_step);
+    for (size_t i = 0; i < debug_points.size(); ++i) {
+      memcpy(&cloud.data[i * 12], debug_points[i].data(), 12);
+    }
+    low_obj_points_publisher_->publish(cloud);
+  }
+
+  // Publish as a DistanceMapSlice: occupied cells -> 0.0 (lethal in the nav2
+  // plugin), everything else -> unknown (skipped by the plugin, so this layer
+  // only ever adds obstacles and cannot clear other layers' costs).
+  constexpr float kUnknownValue = 1000.0f;
+  constexpr float kOccupiedValue = 0.0f;
+  nvblox_msgs::msg::DistanceMapSlice slice;
+  slice.header.frame_id = params_.global_frame.get();
+  slice.header.stamp = timestamp;
+  slice.resolution = res;
+  slice.unknown_value = kUnknownValue;
+  if (low_obj_cells_.empty()) {
+    slice.width = 1;
+    slice.height = 1;
+    slice.origin.x = camera_position.x();
+    slice.origin.y = camera_position.y();
+    slice.data = {kUnknownValue};
+  } else {
+    int min_cx = std::numeric_limits<int>::max(), min_cy = std::numeric_limits<int>::max();
+    int max_cx = std::numeric_limits<int>::min(), max_cy = std::numeric_limits<int>::min();
+    for (const auto & [cell, height] : low_obj_cells_) {
+      min_cx = std::min(min_cx, cell.first);
+      max_cx = std::max(max_cx, cell.first);
+      min_cy = std::min(min_cy, cell.second);
+      max_cy = std::max(max_cy, cell.second);
+    }
+    slice.width = max_cx - min_cx + 1;
+    slice.height = max_cy - min_cy + 1;
+    // The plugin maps a query position p to pixel round((p - origin) / res),
+    // so origin must be the CENTER of the minimum cell.
+    slice.origin.x = (min_cx + 0.5f) * res;
+    slice.origin.y = (min_cy + 0.5f) * res;
+    slice.data.assign(slice.width * slice.height, kUnknownValue);
+    for (const auto & [cell, height] : low_obj_cells_) {
+      slice.data[(cell.second - min_cy) * slice.width + (cell.first - min_cx)] = kOccupiedValue;
+    }
+  }
+  low_obj_map_slice_publisher_->publish(slice);
+
+  // Debug occupancy grid mirroring the slice (occupied = 100, unknown = -1),
+  // analogous to the static/dynamic/combined occupancy grids.
+  if (low_obj_occupancy_grid_publisher_->get_subscription_count() > 0) {
+    nav_msgs::msg::OccupancyGrid grid;
+    grid.header = slice.header;
+    grid.info.map_load_time = slice.header.stamp;
+    grid.info.resolution = res;
+    grid.info.width = slice.width;
+    grid.info.height = slice.height;
+    // OccupancyGrid origin is the lower-left CORNER of cell (0,0), while the
+    // slice origin is that cell's center.
+    grid.info.origin.position.x = slice.origin.x - 0.5 * res;
+    grid.info.origin.position.y = slice.origin.y - 0.5 * res;
+    grid.info.origin.orientation.w = 1.0;
+    grid.data.assign(slice.data.size(), -1);
+    for (size_t i = 0; i < slice.data.size(); ++i) {
+      if (slice.data[i] == kOccupiedValue) {
+        grid.data[i] = 100;
+      }
+    }
+    low_obj_occupancy_grid_publisher_->publish(grid);
+  }
 }
 
 void NvbloxNode::publishDynamics(const std::string & camera_frame_id)
@@ -1211,11 +1497,13 @@ bool NvbloxNode::processColorImage(const ImageTypeVariant & color_msg)
   if (!transformer_.lookupTransformToGlobalFrame(color_frame, color_image_timestamp, &T_L_C)) {
     return false;
   }
+  T_L_C = planarizeCameraPose(T_L_C);
   Transform T_L_C_mask;
   if (mask_img_opt) {
     if (!transformer_.lookupTransformToGlobalFrame(mask_frame, mask_image_timestamp, &T_L_C_mask)) {
       return false;
     }
+    T_L_C_mask = planarizeCameraPose(T_L_C_mask);
   }
   transform_timer.Stop();
 

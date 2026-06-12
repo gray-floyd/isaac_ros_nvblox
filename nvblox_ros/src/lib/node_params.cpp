@@ -131,6 +131,7 @@ void initializeNvbloxNodeParams(
   initParam<bool>(node, &params->print_delays_to_console, parameter_tree);
   initParam<bool>(node, &params->layer_visualization_undo_gamma_correction, parameter_tree);
   initParam<bool>(node, &params->output_pessimistic_distance_map, parameter_tree);
+  initParam<bool>(node, &params->publish_low_obj_map_slice, parameter_tree);
 
   initParam<int>(node, &params->num_cameras, parameter_tree);
   initParam<int>(node, &params->lidar_width, parameter_tree);
@@ -139,6 +140,8 @@ void initializeNvbloxNodeParams(
   initParam<int>(node, &params->print_statistics_on_console_period_ms, parameter_tree);
   initParam<int>(node, &params->maximum_input_queue_length, parameter_tree);
   initParam<int>(node, &params->back_projection_subsampling, parameter_tree);
+  initParam<int>(node, &params->low_obj_min_points, parameter_tree);
+  initParam<int>(node, &params->low_obj_min_frames, parameter_tree);
 
   initParam<float>(node, &params->lidar_vertical_fov_rad, parameter_tree);
   initParam<float>(node, &params->lidar_min_valid_range_m, parameter_tree);
@@ -161,6 +164,11 @@ void initializeNvbloxNodeParams(
   initParam<float>(node, &params->clear_map_outside_radius_rate_hz, parameter_tree);
   initParam<float>(node, &params->map_clearing_radius_m, parameter_tree);
   initParam<float>(node, &params->esdf_and_gradients_unobserved_value, parameter_tree);
+  initParam<float>(node, &params->low_obj_radius_m, parameter_tree);
+  initParam<float>(node, &params->low_obj_min_height_m, parameter_tree);
+  initParam<float>(node, &params->planar_tf_camera_roll_rad, parameter_tree);
+  initParam<float>(node, &params->planar_tf_camera_pitch_rad, parameter_tree);
+  initParam<float>(node, &params->planar_tf_camera_height_m, parameter_tree);
 }
 
 void initializeFuserNodeParams(

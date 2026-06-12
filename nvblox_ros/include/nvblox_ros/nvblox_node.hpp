@@ -30,6 +30,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -206,6 +207,18 @@ protected:
   // Publish the back projected depth image for debug purposes
   void publishBackProjectedDepth(
     const Camera & camera, const std::string & frame, const rclcpp::Time & timestamp);
+
+  // Detect low objects (below the esdf slice band) from the current raw depth
+  // frame and publish them as a costmap slice. Bypasses the voxel map: heights
+  // come from back-projected depth pixels, so sub-voxel objects are detected.
+  void processLowObjects(const Camera & camera, const rclcpp::Time & timestamp);
+
+  // PLANAR TF mode (planar_tf_camera_height_m > 0): rebuild a camera pose
+  // keeping only x, y, yaw from live TF; roll/pitch/height come from the
+  // calibrated mount (VSLAM orientation noise corrupts height-sensitive
+  // mapping on planar robots). Returns T_L_C unchanged when disabled.
+  // Only valid for OPTICAL camera frames (x right, y down, z forward).
+  Transform planarizeCameraPose(const Transform & T_L_C) const;
 
   // Helper function to update the esdf of a specific mapper
   void updateEsdf(
@@ -406,6 +419,12 @@ protected:
     dynamic_map_slice_publisher_;
   rclcpp::Publisher<nvblox_msgs::msg::DistanceMapSlice>::SharedPtr
     combined_map_slice_publisher_;
+  rclcpp::Publisher<nvblox_msgs::msg::DistanceMapSlice>::SharedPtr
+    low_obj_map_slice_publisher_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr
+    low_obj_occupancy_grid_publisher_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
+    low_obj_points_publisher_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr
     static_occupancy_grid_publisher_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr
@@ -526,6 +545,16 @@ protected:
   Pointcloud pointcloud_C_device_;
   Pointcloud human_pointcloud_C_device_;
   Pointcloud human_pointcloud_L_device_;
+
+  // Low object detection state. Cells (keyed by integer grid index in the
+  // global frame at voxel_size resolution) currently holding a low obstacle,
+  // mapped to the max band height (m) ever observed there (kept for debug).
+  Pointcloud low_obj_pointcloud_C_device_;
+  Pointcloud low_obj_pointcloud_L_device_;
+  std::map<std::pair<int, int>, float> low_obj_cells_;
+  // Candidate cells: {consecutive qualifying frames, max band height}. Promoted
+  // to low_obj_cells_ after low_obj_min_frames consecutive passes.
+  std::map<std::pair<int, int>, std::pair<int, float>> low_obj_pending_;
 
   Transform T_L_C_depth_;
 

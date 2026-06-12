@@ -189,6 +189,52 @@ constexpr Param<bool>::Description kLayerVisualizationUndoGammaCorrectionParamDe
 constexpr Param<int>::Description kBackProjectionSubsamplingParamDesc{
   "back_projection_subsampling", 1, "Only back project and publish every n-th depth image."};
 
+// ======= LOW OBJECT DETECTION =======
+// Detects obstacles BELOW the esdf slice band (sub-voxel heights) from raw
+// depth pixels at close range, bypassing the voxel map entirely. Published as
+// a DistanceMapSlice consumable by the nav2 NvbloxCostmapLayer plugin.
+constexpr Param<bool>::Description kPublishLowObjMapSliceParamDesc{
+  "publish_low_obj_map_slice", false,
+  "Detect low static objects (heights in [low_obj_min_height_m, esdf_slice_min_height)) from raw "
+  "depth at close range and publish them on ~/low_obj_map_slice."};
+
+constexpr Param<float>::Description kLowObjRadiusMParamDesc{
+  "low_obj_radius_m", 0.7f,
+  "Only depth points within this horizontal distance of the camera are used for low-object "
+  "detection (raw depth is only trustworthy at close range)."};
+
+constexpr Param<float>::Description kLowObjMinHeightMParamDesc{
+  "low_obj_min_height_m", 0.01f,
+  "Surfaces above this height (and below esdf_slice_min_height) are marked as low obstacles. "
+  "Must be smaller than esdf_slice_min_height."};
+
+constexpr Param<int>::Description kLowObjMinPointsParamDesc{
+  "low_obj_min_points", 5,
+  "Minimum number of band points a cell needs in a single frame to be marked as a low obstacle. "
+  "Filters depth speckle: a real object presents hundreds of points per cell at close range."};
+
+constexpr Param<float>::Description kPlanarTfCameraRollRadParamDesc{
+  "planar_tf_camera_roll_rad", 0.f,
+  "Calibrated camera roll vs ground (rad). Used with planar_tf_camera_height_m > 0."};
+
+constexpr Param<float>::Description kPlanarTfCameraPitchRadParamDesc{
+  "planar_tf_camera_pitch_rad", 0.f,
+  "Calibrated camera pitch vs ground (rad, + = down). Used with planar_tf_camera_height_m > 0."};
+
+constexpr Param<float>::Description kPlanarTfCameraHeightMParamDesc{
+  "planar_tf_camera_height_m", -1.f,
+  "Calibrated camera height above ground (m). > 0 enables PLANAR TF mode for ALL camera "
+  "integration (static TSDF, dynamic occupancy, color, low-object detector): only x, y, yaw "
+  "are taken from live TF; roll/pitch/height use these calibrated constants. Use on planar "
+  "robots with rigidly mounted cameras -- VSLAM roll/pitch/z noise (~1 deg) corrupts "
+  "height-sensitive mapping. <= 0 = use live TF as-is. NOTE: assumes flat floor (no ramps)."};
+
+constexpr Param<int>::Description kLowObjMinFramesParamDesc{
+  "low_obj_min_frames", 3,
+  "Number of consecutive observed frames a cell must pass the low_obj_min_points gate before "
+  "it is marked. Filters single-frame noise bursts; a contradicting observation resets the "
+  "streak, an unobserved frame keeps it (cameras alternate)."};
+
 constexpr Param<float>::Description kLayerStreamerBandwidthLimitMbpsParamDesc{
   "layer_streamer_bandwidth_limit_mbps", 30.f,
   "Bandwidth limit for streaming layer visualizations (over WiFi) in mega-bits per second."};
@@ -338,6 +384,14 @@ public:
   Param<bool> layer_visualization_undo_gamma_correction{
     kLayerVisualizationUndoGammaCorrectionParamDesc};
   Param<bool> output_pessimistic_distance_map{kOutputPessimisticDistanceMap};
+  Param<bool> publish_low_obj_map_slice{kPublishLowObjMapSliceParamDesc};
+  Param<float> low_obj_radius_m{kLowObjRadiusMParamDesc};
+  Param<float> low_obj_min_height_m{kLowObjMinHeightMParamDesc};
+  Param<int> low_obj_min_points{kLowObjMinPointsParamDesc};
+  Param<int> low_obj_min_frames{kLowObjMinFramesParamDesc};
+  Param<float> planar_tf_camera_roll_rad{kPlanarTfCameraRollRadParamDesc};
+  Param<float> planar_tf_camera_pitch_rad{kPlanarTfCameraPitchRadParamDesc};
+  Param<float> planar_tf_camera_height_m{kPlanarTfCameraHeightMParamDesc};
 
   Param<int> maximum_input_queue_length{kMaximumSensorMessageQueueLengthParamDesc};
   Param<int> back_projection_subsampling{kBackProjectionSubsamplingParamDesc};

@@ -140,6 +140,8 @@ void declareMapperParameters(const std::string & mapper_name, rclcpp::Node * nod
   // 2D esdf slice
   declareParameter<float>(mapper_name, kEsdfSliceMinHeightParamDesc, node);
   declareParameter<float>(mapper_name, kEsdfSliceMaxHeightParamDesc, node);
+  declareParameter<float>(mapper_name, kEsdfSliceRawMinHeightParamDesc, node);
+  declareParameter<float>(mapper_name, kEsdfSliceRawMaxHeightParamDesc, node);
   declareParameter<float>(mapper_name, kEsdfSliceHeightParamDesc, node);
   // Decay
   declareParameter<bool>(mapper_name, kExcludeLastViewFromDecayParamDesc, node);
@@ -224,6 +226,12 @@ MapperParams getMapperParamsFromROS(const std::string & mapper_name, rclcpp::Nod
   set_parameter<float>(
     mapper_name, kEsdfSliceMaxHeightParamDesc.name,
     [&](auto value) {params.esdf_integrator_params.esdf_slice_max_height = value;}, node);
+  set_parameter<float>(
+    mapper_name, kEsdfSliceRawMinHeightParamDesc.name,
+    [&](auto value) {params.esdf_integrator_params.esdf_slice_raw_min_height = value;}, node);
+  set_parameter<float>(
+    mapper_name, kEsdfSliceRawMaxHeightParamDesc.name,
+    [&](auto value) {params.esdf_integrator_params.esdf_slice_raw_max_height = value;}, node);
   set_parameter<float>(
     mapper_name, kEsdfSliceHeightParamDesc.name,
     [&](auto value) {params.esdf_integrator_params.esdf_slice_height = value;}, node);
